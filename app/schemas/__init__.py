@@ -84,6 +84,10 @@ class SessionDetail(BaseModel):
     trade_order: Optional[Dict[str, Any]] = None
     # 当前地堡联盟援助协议快照（待签约/押运在途），终局后清空
     aid_pact: Optional[Dict[str, Any]] = None
+    # 当前跨聚落难民安置快照（隔离检疫/待接纳分配），终局后清空
+    refugee_intake: Optional[Dict[str, Any]] = None
+    # 难民安置面板概览（在检/待接纳人数、每日配给、累计统计）
+    refugee_summary: Optional[Dict[str, Any]] = None
     # 医疗救治中心病例簿（登记/治疗/隔离/康复/病亡全履历）与床位概览
     medical_cases: Optional[List[Dict[str, Any]]] = None
     medical_summary: Optional[Dict[str, Any]] = None
@@ -165,6 +169,18 @@ class AidIncidentChoice(BaseModel):
 
 class AidCancel(BaseModel):
     """签约前（proposed）撤回协议。"""
+    token: Optional[str] = None
+
+
+class RefugeeDecide(BaseModel):
+    """审核外部聚落难民安置申请：批准（进入隔离检疫）/ 拒绝（信誉小挫）。"""
+    application_id: str
+
+
+class RefugeeAdmit(BaseModel):
+    """接纳检疫期满难民并分配岗位：{难民 key: 岗位}，缺省按擅长岗位分配。"""
+    assignments: Dict[str, str] = {}
+    # 当前安置快照的一次性凭据，用于识别过期/重复请求
     token: Optional[str] = None
 
 

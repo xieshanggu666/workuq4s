@@ -27,6 +27,12 @@ window.GameView = {
       aidRequest: null,
       aidSignerId: null,
       aidEscorts: [],
+      // 跨聚落难民安置
+      refugeeBoard: null,
+      refugeeBoardLoading: false,
+      showRefugeeDialog: false,
+      refugeeApp: null,
+      refugeeJobs: {},
       // 医疗救治中心
       medRegistering: {},
     };
@@ -335,6 +341,91 @@ window.GameView = {
       const r = this.s.residents.find(x => x.id === this.s.aid_pact.signer_id);
       return r ? r.name : (this.s.aid_pact.signer_name || "?");
     },
+    // ---- 跨聚落难民安置 ----
+    refugeeStatusZh(st) {
+      return { quarantine: "隔离检疫中", admitting: "检疫期满·待接纳",
+               rejected: "已拒绝", repatriated: "已遣返", failed: "检疫失败" }[st] || st;
+    },
+    async openRefugeeBoard() {
+      this.error = "";
+      this.refugeeBoardLoading = true;
+      try {
+        this.refugeeBoard = await Api.get(`/api/sessions/${this.sid}/refugee/board`);
+        this.showRefugeeDialog = true;
+      } catch (e) { this.error = e.message; }
+      finally { this.refugeeBoardLoading = false; }
+    },
+    pickRefugeeApp(a) {
+      this.refugeeApp = a;
+    },
+    async acceptRefugee(app) {
+      this.error = "";
+      if (this.actionLocked) return;
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/refugee/accept`, {
+          application_id: app.id,
+        });
+        this.showRefugeeDialog = false;
+        this.refugeeApp = null;
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    async rejectRefugee(app) {
+      this.error = "";
+      if (this.actionLocked) return;
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/refugee/reject`, {
+          application_id: app.id,
+        });
+        this.showRefugeeDialog = false;
+        this.refugeeApp = null;
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    setRefugeeJob(key, job) {
+      this.refugeeJobs = { ...this.refugeeJobs, [key]: job };
+    },
+    async admitRefugees() {
+      this.error = "";
+      if (this.actionLocked) return;
+      const intake = this.s.refugee_intake;
+      const assignments = {};
+      for (const p of (intake.people || [])) {
+        if (p.alive) assignments[p.key] = this.refugeeJobs[p.key] || p.skill || "general";
+      }
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/refugee/admit`, {
+          assignments,
+          token: intake.token,
+        });
+        this.refugeeJobs = {};
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    async repatriateRefugees() {
+      this.error = "";
+      if (this.actionLocked) return;
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/refugee/repatriate`, {});
+        this.refugeeJobs = {};
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    refugeeAlivePeople(intake) {
+      return (intake && intake.people || []).filter(p => p.alive);
+    },
+    refugeeSkillZh(skill) {
+      return { engineer: "工程师", farmer: "农民", medic: "医护", general: "杂工" }[skill] || skill;
+    },
+    fmtRefugeeCost(bag) {
+      return Object.entries(bag || {}).map(([k, v]) =>
+        `${{food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] || k} ${Math.round(v * 10) / 10}`
+      ).join("、");
+    },
     // ---- 医疗救治中心 ----
     medCaseOf(rid) {
       const cases = (this.s && this.s.medical_cases) || [];
@@ -403,6 +494,16 @@ window.GameView = {
     },
     aidPending() {
       return !!(this.s && this.s.aid_pact && this.s.aid_pact.pending_incident);
+    },
+    refugeeIntake() {
+      return this.s ? this.s.refugee_intake : null;
+    },
+    refugeeAliveCount() {
+      const intake = this.refugeeIntake;
+      return intake ? (intake.people || []).filter(p => p.alive).length : 0;
+    },
+    refugeeStats() {
+      return (this.s && this.s.refugee_summary && this.s.refugee_summary.stats) || {};
     },
     // 可会签的医护负责人：在堡、存活、无未结病例
     aidEligibleMedics() {
@@ -482,6 +583,7 @@ window.GameView = {
         <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ expMemberCount }})</template></button>
         <button :class="{ active: tab==='trade' }" @click="tab='trade'">贸易救援<template v-if="s.trade_order"> ●</template></button>
         <button :class="{ active: tab==='aid' }" @click="tab='aid'">联盟援助<template v-if="s.aid_pact"> ●</template></button>
+        <button :class="{ active: tab==='refugee' }" @click="tab='refugee'">难民安置<template v-if="refugeeIntake"> ({{ refugeeAliveCount }})</template></button>
         <button :class="{ active: tab==='medical' }" @click="tab='medical'">医疗救治<template v-if="medActiveCount"> ({{ medActiveCount }})</template></button>
         <button :class="{ active: tab==='build' }" @click="tab='build'">设施扩建</button>
         <button :class="{ active: tab==='log' }" @click="tab='log'">大事记</button>
@@ -658,6 +760,98 @@ window.GameView = {
               <span class="dim" v-if="s.aid_pact.status==='escorting' && !aidPending">押运队在途，推进一天以继续运输</span>
               <span class="dim" v-if="aidPending" style="color:var(--warn)">援助途中出现突发状况，请先抉择</span>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 跨聚落难民安置 -->
+      <div v-if="tab==='refugee'">
+        <div class="exp-panel">
+          <div class="med-head">
+            <span class="chip rep">地堡信誉 {{ s.reputation }}</span>
+            <span class="chip">已接纳 {{ refugeeStats.admitted || 0 }} 人</span>
+            <span class="chip">检疫病亡 {{ refugeeStats.quarantine_dead || 0 }} 人</span>
+            <span class="chip">已遣返 {{ refugeeStats.repatriated || 0 }} 人</span>
+          </div>
+          <!-- 无在处理安置：查看公告板 -->
+          <div v-if="!refugeeIntake" class="exp-empty">
+            <p>荒原上的外部聚落每天发来<b>难民安置申请</b>。由地堡审核：批准后难民进入
+               <b>隔离检疫</b>（2 天），隔离舱按人每日消耗食物、水源与电力；
+               有疫区接触史者可能在检疫中确诊，已建救治中心时医护可加速转阴。</p>
+            <p class="dim">检疫期满后须<b>接纳并分配岗位</b>（未转阴者转入隔离病例、体弱者登记伤病病例），
+               每人提升信誉与在堡士气；也可以遣返全部难民但承担信誉与士气代价；
+               直接拒绝申请仅小幅降低信誉。物资不足会令在检难民健康与士气下滑。</p>
+            <button class="btn primary" :disabled="s.status!=='running' || actionLocked"
+                    @click="openRefugeeBoard">
+              {{ refugeeBoardLoading ? '通讯中…' : '查看难民安置公告板' }}
+            </button>
+          </div>
+          <!-- 在处理安置 -->
+          <div v-else class="exp-status">
+            <div class="exp-row">
+              <span class="k">状态</span>
+              <span class="v">
+                <span class="chip" :class="refugeeIntake.status">{{ refugeeStatusZh(refugeeIntake.status) }}</span>
+                <b style="margin-left:8px">难民安置 · {{ refugeeIntake.partner_name }}</b>
+              </span>
+            </div>
+            <div class="exp-row" v-if="refugeeIntake.status==='quarantine'">
+              <span class="k">检疫进度</span>
+              <span class="v">第 {{ refugeeIntake.elapsed }} / {{ s.refugee_summary.quarantine_days }} 天</span>
+            </div>
+            <div class="exp-row" v-if="refugeeIntake.status==='quarantine'">
+              <span class="k">每日隔离配给</span>
+              <span class="v">{{ fmtRefugeeCost(s.refugee_summary.daily_cost) }}</span>
+            </div>
+            <div class="exp-row" v-if="refugeeIntake.dead && refugeeIntake.dead.length">
+              <span class="k">检疫病亡</span>
+              <span class="v" style="color:var(--danger)">{{ refugeeIntake.dead.map(d => d.name).join('、') }}</span>
+            </div>
+
+            <!-- 难民名单 -->
+            <div class="refugee-list">
+              <div v-for="p in refugeeAlivePeople(refugeeIntake)" :key="p.key" class="refugee-item"
+                   :class="{ sick: p.infectious, exposed: !p.infectious && p.exposed }">
+                <span class="p-avatar">{{ p.name[0] }}</span>
+                <div class="rf-info">
+                  <div class="mc-name">
+                    {{ p.name }}
+                    <span v-if="p.infectious" class="chip med-tag isolated">确诊疫病</span>
+                    <span v-else-if="p.exposed" class="chip review-tag">疫区接触史</span>
+                    <span class="dim">擅长 {{ refugeeSkillZh(p.skill) }}</span>
+                  </div>
+                  <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: p.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(p.health) }}</b></div>
+                  <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: p.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(p.morale) }}</b></div>
+                </div>
+                <div class="rf-job" v-if="refugeeIntake.status==='admitting'">
+                  <select :value="refugeeJobs[p.key] || p.skill"
+                          :disabled="actionLocked"
+                          @change="setRefugeeJob(p.key, $event.target.value)">
+                    <option value="engineer">工程师</option>
+                    <option value="farmer">农民</option>
+                    <option value="medic">医护</option>
+                    <option value="general">杂工</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div class="exp-actions">
+              <template v-if="refugeeIntake.status==='quarantine'">
+                <span class="dim">隔离检疫进行中，推进一天以继续检疫；物资不足时在检难民健康与士气会下滑。</span>
+              </template>
+              <template v-else>
+                <button class="btn primary" :disabled="s.status!=='running' || actionLocked" @click="admitRefugees">
+                  {{ loading ? '接纳中…' : '接纳并分配岗位（每人信誉 +4）' }}
+                </button>
+                <button class="btn danger" :disabled="s.status!=='running' || actionLocked" @click="repatriateRefugees">
+                  全部遣返（信誉 -5、士气 -3）
+                </button>
+              </template>
+            </div>
+            <p class="dim" v-if="refugeeIntake.status==='admitting'" style="color:var(--warn)">
+              检疫已结束，请尽快接纳或遣返；未转阴的确诊者接纳时将立即转入救治中心隔离床位（床位不足则登记待收治）。
+            </p>
           </div>
         </div>
       </div>
@@ -864,6 +1058,75 @@ window.GameView = {
             <span class="hint">{{ c.hint }}</span>
           </button>
         </div>
+      </div>
+    </div>
+
+    <!-- 难民安置公告板弹层 -->
+    <div v-if="showRefugeeDialog" class="overlay">
+      <div class="crisis refugee market-dialog">
+        <h2>🧑‍🤝‍🧑 跨聚落难民安置公告板</h2>
+        <p class="crisis-desc">第 {{ refugeeBoard.day }} 天的安置申请（每日轮换）。当前信誉 <b>{{ refugeeBoard.reputation }}</b>。
+          批准后难民入堡隔离检疫 {{ 2 }} 天，每人每日消耗隔离配给。</p>
+        <template v-if="!refugeeApp">
+          <div class="market-list">
+            <div v-for="a in refugeeBoard.applications" :key="a.id" class="market-offer refugee-offer"
+                 @click="pickRefugeeApp(a)">
+              <div class="mo-head">
+                <span class="chip rescue">难民 {{ a.count }} 人</span>
+                <strong>{{ a.partner_name }}</strong>
+                <span class="dim">检疫 {{ a.quarantine_days }} 天</span>
+              </div>
+              <div class="refugee-chips">
+                <span v-for="p in a.people" :key="p.key" class="chip"
+                      :class="p.infectious ? 'rescue' : (p.exposed ? 'reviewing' : 'procure')">
+                  {{ p.name }}·{{ refugeeSkillZh(p.skill) }}·{{ fmt(p.health) }}
+                </span>
+              </div>
+              <div class="mo-flow">
+                <span>每日配给（全员）：<b>{{ fmtRefugeeCost(a.daily_cost) }}</b></span>
+              </div>
+              <div class="dim">{{ a.hint }}</div>
+            </div>
+          </div>
+          <div class="choices">
+            <button class="choice" @click="showRefugeeDialog=false"><strong>关闭</strong></button>
+          </div>
+        </template>
+        <template v-else>
+          <div class="market-offer refugee-offer">
+            <div class="mo-head">
+              <span class="chip rescue">难民 {{ refugeeApp.count }} 人</span>
+              <strong>{{ refugeeApp.partner_name }}</strong>
+              <span class="dim">检疫 {{ refugeeApp.quarantine_days }} 天</span>
+            </div>
+            <div class="refugee-list">
+              <div v-for="p in refugeeApp.people" :key="p.key" class="refugee-item"
+                   :class="{ sick: p.infectious, exposed: !p.infectious && p.exposed }">
+                <span class="p-avatar">{{ p.name[0] }}</span>
+                <div class="rf-info">
+                  <div class="mc-name">
+                    {{ p.name }}
+                    <span v-if="p.infectious" class="chip med-tag isolated">已发热</span>
+                    <span v-else-if="p.exposed" class="chip review-tag">接触史</span>
+                    <span class="dim">擅长 {{ refugeeSkillZh(p.skill) }}</span>
+                  </div>
+                  <div class="dim">健康 {{ fmt(p.health) }} · 士气 {{ fmt(p.morale) }}</div>
+                </div>
+              </div>
+            </div>
+            <p class="dim" style="margin:8px 0">全员每日隔离配给：<b>{{ fmtRefugeeCost(refugeeApp.daily_cost) }}</b></p>
+          </div>
+          <div class="choices">
+            <button class="choice primary-choice" :disabled="loading"
+                    @click="acceptRefugee(refugeeApp)">
+              <strong>{{ loading ? '审核中…' : '批准安置 · 进入隔离检疫' }}</strong>
+            </button>
+            <button class="choice" :disabled="loading" @click="rejectRefugee(refugeeApp)">
+              <strong>拒绝申请（信誉 -2）</strong>
+            </button>
+            <button class="choice" @click="refugeeApp=null"><strong>返回申请列表</strong></button>
+          </div>
+        </template>
       </div>
     </div>
 

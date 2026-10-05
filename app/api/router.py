@@ -31,6 +31,8 @@ from ..schemas import (
     AidPropose,
     AidIncidentChoice,
     AidCancel,
+    RefugeeDecide,
+    RefugeeAdmit,
     JobAssign,
     MedicalRegister,
     MedicalAdmit,
@@ -196,9 +198,12 @@ def get_session_detail(gs, db):
         expedition=gs.expedition,
         trade_order=gs.trade_order,
         aid_pact=gs.aid_pact,
+        refugee_intake=gs.refugee_intake,
         medical_cases=med_cases,
         # 床位/医护/病例计数概览（纯派生，由引擎计算保证与口径一致）
         medical_summary=BunkerEngine(db, gs).med_summary(),
+        # 难民安置概览（在检/待接纳人数、每日配给、累计统计）
+        refugee_summary=BunkerEngine(db, gs).refugee_summary(),
         medical_crisis=gs.medical_crisis or 0,
         reputation=gs.reputation if gs.reputation is not None else 50,
         residents=residents,
@@ -255,7 +260,15 @@ def _run_decision(db, gs, resolve, reconcile):
         db.refresh(gs)
     except BunkerEngineConflict as e:
         db.rollback()
-        raise HTTPException(409, str(e))
+        # 业务级冲突（安置已被并发动作清除等）同样尝试幂等核对：
+        # 命中同一次处置则安全回放 200，对不上再抛 409
+        db.refresh(gs)
+        try:
+            reconcile(BunkerEngine(db, gs))
+            db.commit()
+            db.refresh(gs)
+        except BunkerEngineConflict:
+            raise HTTPException(409, str(e))
     except BunkerEngineError as e:
         db.rollback()
         raise HTTPException(400, str(e))
@@ -429,6 +442,64 @@ def aid_cancel(sid: int, body: AidCancel, db: Session = Depends(get_db)):
         db, gs,
         lambda eng: eng.cancel_aid(token=body.token),
         lambda eng: eng.reconcile_stale_aid("cancel", token=body.token),
+    )
+    return get_session_detail(gs, db)
+
+
+# ---- 跨聚落难民安置 ----
+@router.get("/sessions/{sid}/refugee/board")
+def refugee_board(sid: int, db: Session = Depends(get_db)):
+    """当日外部聚落的难民安置申请（按天确定性轮换，只读）。"""
+    gs = _get_session_or_404(db, sid)
+    eng = BunkerEngine(db, gs)
+    return {
+        "day": gs.day,
+        "reputation": gs.reputation if gs.reputation is not None else 50,
+        "active": gs.refugee_intake is not None,
+        "applications": eng.refugee_board(),
+    }
+
+
+@router.post("/sessions/{sid}/refugee/accept", response_model=SessionDetail)
+def refugee_accept(sid: int, body: RefugeeDecide, db: Session = Depends(get_db)):
+    """地堡审核通过安置申请：难民进入隔离检疫。"""
+    gs = _get_session_or_404(db, sid)
+    _run_mutation(db, gs, lambda eng: eng.accept_refugees(body.application_id))
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/refugee/reject", response_model=SessionDetail)
+def refugee_reject(sid: int, body: RefugeeDecide, db: Session = Depends(get_db)):
+    """地堡拒绝安置申请：不消耗物资，信誉小挫。"""
+    gs = _get_session_or_404(db, sid)
+    _run_mutation(db, gs, lambda eng: eng.reject_refugees(body.application_id))
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/refugee/admit", response_model=SessionDetail)
+def refugee_admit(sid: int, body: RefugeeAdmit, db: Session = Depends(get_db)):
+    """接纳检疫期满难民并分配岗位：联动病例建档、信誉与士气结算。"""
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.admit_refugees(assignments=body.assignments, token=body.token),
+        lambda eng: eng.reconcile_stale_refugee(
+            "admit", token=body.token or (gs.refugee_intake or {}).get("token")
+        ),
+    )
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/refugee/repatriate", response_model=SessionDetail)
+def refugee_repatriate(sid: int, db: Session = Depends(get_db)):
+    """检疫期满后遣返全部待接纳难民：信誉与在堡士气受挫。"""
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.repatriate_refugees(),
+        lambda eng: eng.reconcile_stale_refugee(
+            "repatriate", token=(gs.refugee_intake or {}).get("token")
+        ),
     )
     return get_session_detail(gs, db)
 

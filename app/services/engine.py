@@ -121,6 +121,36 @@ MED_INFECTIOUS_INCIDENT_EVENTS = {"duststorm"}
 MED_INFECTIOUS_AID_EVENTS = {"quarantine"}
 
 
+# 跨聚落难民安置系统：外部聚落提交安置申请，地堡审核后进入隔离检疫，
+# 检疫期满经"接纳 + 岗位分配"转为正式居民（联动医疗病例/资源消耗/信誉结算）。
+# 安置不派离堡队伍：难民在堡内隔离舱中消耗地堡物资，不与探索队/贸易/援助互斥。
+REFUGEE_QUARANTINE, REFUGEE_ADMITTING = "quarantine", "admitting"
+REFUGEE_REJECTED, REFUGEE_REPATRIATED = "rejected", "repatriated"
+REFUGEE_FAILED = "failed"          # 检疫期满无存活者：安置失败
+REFUGEE_MAX_APPLICANTS = 3         # 每份申请难民人数上限
+REFUGEE_QUARANTINE_DAYS = 2        # 隔离检疫天数
+REFUGEE_DAILY_COST = {FOOD: 0.8, WATER: 0.7, POWER: 0.5}  # 每人每日检疫消耗
+REFUGEE_SHORTAGE_HEALTH = 6.0      # 物资不足配给：每名难民每日健康损失
+REFUGEE_SHORTAGE_MORALE = 5.0      # 物资不足配给：每名难民每日士气损失
+REFUGEE_EXPOSE_CHANCE = 0.25       # 接触史（exposed）难民每日确诊基础概率
+REFUGEE_EXPOSE_MEDIC_REDUCE = 0.05 # 每名当值医护降低的确诊概率
+REFUGEE_EXPOSE_MIN_CHANCE = 0.10   # 确诊概率下限（医护再多也不归零）
+REFUGEE_EXPOSE_DAMAGE = 12.0       # 确诊时的即时健康损伤
+REFUGEE_INFECT_HEAL = 4.0          # 已确诊难民在有救治体系时每日基础救治
+REFUGEE_INFECT_MEDIC_HEAL = 0.8    # 每名当值医护对确诊难民的额外救治
+REFUGEE_INFECT_NOCLINIC = 3.0      # 无救治体系时确诊难民每日额外恶化
+REFUGEE_WOUNDED_HEAL = 3.0         # 体弱（健康低于巡检登记线）未确诊难民每日回复
+REFUGEE_NEGATIVE_HEALTH = 75.0     # 确诊难民健康跨过此线即解除确诊（检疫康复）
+REFUGEE_MORALE_DRIFT = 1.0         # 检疫期士气每日向基准 60 自然恢复
+REFUGEE_REP_REJECT = -2            # 拒绝外部聚落安置申请：信誉小挫
+REFUGEE_REP_ADMIT = 4              # 每名成功接纳并分配岗位的难民：信誉提升
+REFUGEE_REP_REPATRIATE = -5        # 检疫期满后遣返全部难民：人道代价
+REFUGEE_REP_DEATH = -2             # 检疫期每名病亡难民的信誉代价
+REFUGEE_ADMIT_MORALE = 5.0         # 接纳难民：在堡全员（含新居民）士气提升
+REFUGEE_REPATRIATE_MORALE = -3.0   # 遣返难民：在堡全员士气受挫
+REFUGEE_JOIN_HEALTH = 70.0         # 危机事件直接加入的幸存者健康（既有口径）
+
+
 def _clamp(v, lo=0.0, hi=100.0):
     return max(lo, min(hi, v))
 
@@ -354,6 +384,9 @@ class BunkerEngine:
         # 医疗救治中心每日健康结算：病例治疗/隔离消耗、传染扩散、康复病亡收敛。
         # 离堡成员的病例随队伍冻结，只结算在堡病例，与产出/口粮同一口径
         self._apply_medical_tick()
+        # 跨聚落难民安置每日检疫结算：隔离物资配给、接触史确诊、确诊救治/病亡、
+        # 检疫期满转入待接纳。难民尚未计入居民表，独立消耗隔离舱配给
+        self._apply_refugee_tick(pre_verdict=pre_verdict)
         exp = self.session.expedition
         if exp and exp.get("status") == "away":
             # 探索队在外出差：地堡按在堡人口结算，探索队消耗自带物资、行军并触发遭遇
@@ -2365,6 +2398,516 @@ class BunkerEngine:
         return detail, False
 
 
+    # ---- 跨聚落难民安置 ----
+    # 状态链（难民在堡内隔离舱安置，不派离堡队伍，不与探索/贸易/援助互斥）：
+    #   外部聚落公告板每日发布难民安置申请（确定性轮换）
+    #     ├─ 拒绝（reject）：申请关闭，信誉小挫
+    #     └─ 批准（accept）：quarantine 隔离检疫开始
+    #          每日推进：隔离配给（食物/水/电）→ 接触史确诊 → 确诊救治/恶化/病亡
+    #          ├─ 检疫期满无人存活：failed，按病亡人数扣信誉，安置关闭
+    #          └─ 检疫期满有幸存者：admitting 待接纳（暂停消耗）
+    #               ├─ 接纳并分配岗位（admit）：每人结算信誉，未确诊疫病例登记/隔离，
+    #               │                         弱智者登记普通病例，新居民加入地堡
+    #               └─ 遣返（repatriate）：repatriated，信誉与士气受挫，安置关闭
+    def refugee_board(self):
+        """生成当日外部聚落的难民安置申请（确定性，无副作用）。
+
+        以"日期"为种子：同一天内重复查看申请一致，跨天自动轮换；批准时引擎
+        重新生成当日公告板并核对 application_id，过期（跨天/被轮换掉）无法批准。
+        每份申请来自一个聚落，含 1-3 名难民（健康/士气/接触史/擅长岗位各异）。
+        """
+        import random
+        rng = random.Random(f"bunker-refugee-board-day-{self.session.day}")
+        partners = list(REFUGEE_PARTNERS)
+        rng.shuffle(partners)
+        surnames = list("赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜")
+        givens = list("伟芳娜敏静丽强磊军洋勇艳杰娟涛明超秀兰霞平刚桂英华玉萍红斌晨雪辉宁")
+        applications = []
+        for p in partners[:2]:
+            n = rng.randint(1, REFUGEE_MAX_APPLICANTS)
+            people = []
+            for _ in range(n):
+                # 难民健康普遍偏弱：多数人体弱，少数人已出现高热（确诊疫病）
+                roll = rng.random()
+                if roll < 0.20:
+                    health = rng.randint(22, 34)      # 高热病患：直接确诊
+                    exposed, infectious = True, True
+                elif roll < 0.60:
+                    health = rng.randint(38, 62)      # 体弱：可能带接触史
+                    exposed, infectious = rng.random() < 0.5, False
+                else:
+                    health = rng.randint(63, 80)      # 基本健康
+                    exposed, infectious = rng.random() < 0.3, False
+                skill_roll = rng.random()
+                if skill_roll < 0.08:
+                    skill = "medic"
+                elif skill_roll < 0.28:
+                    skill = "engineer"
+                elif skill_roll < 0.53:
+                    skill = "farmer"
+                else:
+                    skill = "general"
+                people.append({
+                    "key": uuid.uuid4().hex[:8],
+                    "name": rng.choice(surnames) + rng.choice(givens),
+                    "health": float(health),
+                    "morale": float(rng.randint(45, 70)),
+                    "exposed": bool(exposed),          # 疫区接触史：检疫期可能确诊
+                    "infectious": bool(infectious),    # 抵达时已确诊
+                    "skill": skill,                    # 擅长岗位（接纳时预填）
+                    "alive": True,
+                })
+            total = len(people)
+            sick = sum(1 for x in people if x["infectious"] or x["exposed"])
+            applications.append({
+                "id": f"rf-{p['key']}-{self.session.day}",
+                "partner": p["key"],
+                "partner_name": p["name"],
+                "count": total,
+                "people": people,
+                "daily_cost": {k: round(v * total, 1) for k, v in REFUGEE_DAILY_COST.items()},
+                "quarantine_days": REFUGEE_QUARANTINE_DAYS,
+                "hint": (
+                    f"{p['name']} 有 {total} 名流民请求安置，其中 {sick} 人有疫区接触史"
+                    f"或已出现发热症状；须隔离检疫 {REFUGEE_QUARANTINE_DAYS} 天，"
+                    f"每人每日消耗隔离配给。"
+                ),
+            })
+        return applications
+
+    def _find_refugee_application(self, application_id):
+        return next((a for a in self.refugee_board() if a["id"] == application_id), None)
+
+    def refugee_stats(self):
+        """难民安置累计统计（缺列旧档案从零开始）。"""
+        stats = self.session.refugee_stats or {}
+        return {
+            "applications": int(stats.get("applications", 0)),
+            "accepted": int(stats.get("accepted", 0)),
+            "admitted": int(stats.get("admitted", 0)),
+            "rejected": int(stats.get("rejected", 0)),
+            "repatriated": int(stats.get("repatriated", 0)),
+            "quarantine_dead": int(stats.get("quarantine_dead", 0)),
+        }
+
+    def _bump_refugee_stats(self, **deltas):
+        from sqlalchemy.orm.attributes import flag_modified
+        stats = dict(self.session.refugee_stats or {})
+        for k, v in deltas.items():
+            stats[k] = int(stats.get(k, 0)) + v
+        self.session.refugee_stats = stats
+        flag_modified(self.session, "refugee_stats")
+
+    def refugee_summary(self):
+        """难民安置面板概览（无副作用）：当前安置进度、在检/待接纳人数与累计统计。"""
+        intake = self.session.refugee_intake
+        summary = {
+            "active": intake is not None,
+            "status": intake.get("status") if intake else None,
+            "partner_name": intake.get("partner_name") if intake else None,
+            "quarantine_days": REFUGEE_QUARANTINE_DAYS,
+            "elapsed": intake.get("elapsed", 0) if intake else 0,
+            "quarantining": 0,
+            "admitting": 0,
+            "dead": intake.get("dead", []) if intake else [],
+            "daily_cost": {},
+            "stats": self.refugee_stats(),
+        }
+        if intake:
+            alive = [p for p in intake.get("people", []) if p.get("alive")]
+            if intake.get("status") == REFUGEE_QUARANTINE:
+                summary["quarantining"] = len(alive)
+                summary["daily_cost"] = {
+                    k: round(v * len(alive), 1) for k, v in REFUGEE_DAILY_COST.items()
+                }
+            else:
+                summary["admitting"] = len(alive)
+        return summary
+
+    # 难民安置动作类型（档案级幂等凭据 last_refugee 的 action 取值）
+    _REF_ACT_ACCEPT = "accept"
+    _REF_ACT_REJECT = "reject"
+    _REF_ACT_ADMIT = "admit"
+    _REF_ACT_REPATRIATE = "repatriate"
+    _REF_ACT_SETTLE = "settle"   # 安置自动收敛（检疫失败）
+
+    def _refugee_replay(self, action, token=None, application_id=None):
+        """命中央档级幂等凭据则返回 (detail, True)，否则 (None, False)。
+
+        token（接纳/遣返绑定安置 token）或 application_id（批准/拒绝绑定当日
+        申请）任一非空都必须与凭据逐字相等，避免把 A 申请的结果误回放给 B 申请。
+        """
+        rec = self.session.last_refugee
+        if not rec or rec.get("action") != action:
+            return None, False
+        if token and rec.get("token") and rec.get("token") != token:
+            return None, False
+        if application_id is not None and rec.get("application_id") != application_id:
+            return None, False
+        return rec.get("detail", ""), True
+
+    def _remember_refugee(self, detail, action, token=None, application_id=None):
+        rec = {
+            "action": action, "token": token,
+            "day": self.session.day, "detail": detail,
+        }
+        if application_id is not None:
+            rec["application_id"] = application_id
+        self.session.last_refugee = rec
+
+    def accept_refugees(self, application_id):
+        """地堡审核通过外部聚落的安置申请：建立隔离检疫安置。"""
+        self._require_daily_phase("批准难民安置申请")
+        replay = self._refugee_replay(
+            self._REF_ACT_ACCEPT, application_id=application_id
+        )
+        if replay[0] is not None:
+            return replay
+        if self.session.refugee_intake:
+            raise BunkerEngineError("已有一批难民正在安置中，无法同时接收新申请")
+        app = self._find_refugee_application(application_id)
+        if app is None:
+            raise BunkerEngineError("安置申请已过期或不存在（公告板每日轮换），请重新查看")
+        alive_people = [p for p in app["people"] if p.get("alive", True)]
+        if not alive_people:
+            raise BunkerEngineError("该批难民已无人存活，无法接收")
+        intake = {
+            "token": uuid.uuid4().hex,
+            "application_id": app["id"],
+            "partner": app["partner"],
+            "partner_name": app["partner_name"],
+            "status": REFUGEE_QUARANTINE,
+            "applied_day": self.session.day,
+            "elapsed": 0,
+            "people": [dict(p) for p in alive_people],
+            "dead": [],
+        }
+        self.session.refugee_intake = dict(intake)
+        self._bump_refugee_stats(applications=1, accepted=len(alive_people))
+        names = "、".join(p["name"] for p in alive_people)
+        self._log(
+            "refugee", f"难民安置·{app['partner_name']}",
+            f"地堡审核通过 {app['partner_name']} 的安置申请，{names}（共 {len(alive_people)} 人）"
+            f"进入隔离舱，开始 {REFUGEE_QUARANTINE_DAYS} 天检疫。",
+            decision="批准安置",
+        )
+        detail = f"{len(alive_people)} 名难民进入隔离检疫"
+        self._remember_refugee(
+            detail, self._REF_ACT_ACCEPT, token=intake["token"], application_id=app["id"]
+        )
+        return detail, False
+
+    def reject_refugees(self, application_id):
+        """地堡拒绝外部聚落的安置申请：不消耗物资，信誉小挫。"""
+        self._require_daily_phase("拒绝难民安置申请")
+        replay = self._refugee_replay(
+            self._REF_ACT_REJECT, application_id=application_id
+        )
+        if replay[0] is not None:
+            return replay
+        app = self._find_refugee_application(application_id)
+        if app is None:
+            raise BunkerEngineError("安置申请已过期或不存在（公告板每日轮换），请重新查看")
+        if self.session.refugee_intake:
+            raise BunkerEngineError("已有一批难民正在安置中，无法处理新申请")
+        rep_now = self._add_reputation(REFUGEE_REP_REJECT)
+        self._bump_refugee_stats(applications=1, rejected=app["count"])
+        self._log(
+            "refugee", f"拒绝安置·{app['partner_name']}",
+            f"地堡回绝了 {app['partner_name']} 的 {app['count']} 人安置申请，"
+            f"信誉 {REFUGEE_REP_REJECT:+d}（现 {rep_now}）。",
+            decision="拒绝安置",
+        )
+        detail = f"拒绝 {app['count']} 名难民入境，信誉 {REFUGEE_REP_REJECT:+d}（现 {rep_now}）"
+        # 拒绝不产生持续宿主：仍写幂等凭据（绑定当日申请 id），连点/并发落败按同一结果回放
+        self._remember_refugee(detail, self._REF_ACT_REJECT, application_id=app["id"])
+        return detail, False
+
+    def _apply_refugee_tick(self, pre_verdict=None):
+        """每日检疫结算。admitting 阶段难民等待接纳，不再消耗物资。"""
+        intake = self.session.refugee_intake
+        if not intake or intake.get("status") != REFUGEE_QUARANTINE:
+            return
+        # 终局日（抵达目标日/全线枯竭已锁定）不再检疫消耗：随 _finish 清空安置
+        if pre_verdict is not None:
+            return
+        alive = [p for p in intake["people"] if p.get("alive")]
+        if not alive:
+            self._fail_refugee_intake(intake, reason="隔离检疫开始前难民已无人存活")
+            return
+        # 1) 隔离配给：任一物资不足则当日断供，全员健康/士气受挫
+        n = len(alive)
+        need = {k: round(v * n, 1) for k, v in REFUGEE_DAILY_COST.items()}
+        res = self.get_resources()
+        rationed = all(res.get(k, 0) >= v for k, v in need.items())
+        if rationed:
+            for k, v in need.items():
+                self._add_resource(k, -v)
+        else:
+            for p in alive:
+                p["health"] = _clamp(p["health"] - REFUGEE_SHORTAGE_HEALTH)
+                p["morale"] = _clamp(p["morale"] - REFUGEE_SHORTAGE_MORALE)
+
+        # 2) 医疗筛查：确诊者救治/恶化，接触史者掷确诊，体弱者缓慢恢复
+        clinic = self._active_clinic()
+        medics = self.medic_count()
+        newly_diagnosed = []
+        parts = []
+        for p in alive:
+            if p["infectious"]:
+                if clinic is not None:
+                    heal = REFUGEE_INFECT_HEAL + REFUGEE_INFECT_MEDIC_HEAL * medics
+                    p["health"] = _clamp(p["health"] + heal)
+                    if p["health"] >= REFUGEE_NEGATIVE_HEALTH:
+                        p["infectious"] = False
+                        p["exposed"] = False
+                        parts.append(f"{p['name']} 检疫康复")
+                else:
+                    p["health"] = _clamp(p["health"] - REFUGEE_INFECT_NOCLINIC)
+            elif p["exposed"]:
+                chance = max(
+                    REFUGEE_EXPOSE_MIN_CHANCE,
+                    REFUGEE_EXPOSE_CHANCE - REFUGEE_EXPOSE_MEDIC_REDUCE * medics,
+                )
+                if self.rand.random() < chance:
+                    p["infectious"] = True
+                    p["health"] = _clamp(p["health"] - REFUGEE_EXPOSE_DAMAGE)
+                    newly_diagnosed.append(p["name"])
+            elif p["health"] < MED_AUTO_REGISTER_HEALTH and clinic is not None:
+                # 体弱但未接触疫区：医疗筛查帮助其缓慢恢复
+                p["health"] = _clamp(p["health"] + REFUGEE_WOUNDED_HEAL)
+            # 检疫期士气向基准 60 缓慢恢复
+            if p["morale"] < 60:
+                p["morale"] = _clamp(p["morale"] + REFUGEE_MORALE_DRIFT)
+
+        # 3) 病亡收敛
+        dead_names = []
+        for p in alive:
+            if p["health"] <= 0:
+                p["alive"] = False
+                p["health"] = 0
+                dead_names.append(p["name"])
+                intake.setdefault("dead", []).append({"name": p["name"], "day": self.session.day})
+        for name in newly_diagnosed:
+            self._log("medical", "难民确诊", f"隔离筛查中 {name} 确诊疫病（健康 -{REFUGEE_EXPOSE_DAMAGE:g}）。",
+                      decision="隔离检疫")
+        for name in dead_names:
+            self._log("refugee", "难民检疫病亡", f"{name} 在隔离检疫中病亡。", decision="检疫病亡")
+
+        intake["elapsed"] = intake.get("elapsed", 0) + 1
+        self.session.refugee_intake = dict(intake)
+
+        survivors = [p for p in intake["people"] if p.get("alive")]
+        if not survivors:
+            self._fail_refugee_intake(
+                self.session.refugee_intake, reason="隔离检疫期间难民全部病亡"
+            )
+            return
+        if intake["elapsed"] >= REFUGEE_QUARANTINE_DAYS:
+            intake = self.session.refugee_intake
+            intake["status"] = REFUGEE_ADMITTING
+            self.session.refugee_intake = dict(intake)
+            sick_n = sum(1 for p in survivors if p["infectious"])
+            self._log(
+                "refugee", "检疫期满",
+                f"{intake['partner_name']} 的 {len(survivors)} 名难民检疫期满"
+                + (f"，其中 {sick_n} 人仍为确诊疫病例须隔离收治" if sick_n else "，无人确诊疫病")
+                + "，等待接纳与岗位分配。",
+                decision="检疫结束",
+            )
+            return
+        # 检疫中日志（聚合一行）
+        tick_parts = []
+        cost_txt = "、".join(f"{RESOURCE_ZH[k]} -{v:g}" for k, v in need.items())
+        tick_parts.append(f"配给 {n} 人（{cost_txt}）" if rationed else f"物资不足，{n} 人断供")
+        if newly_diagnosed:
+            tick_parts.append(f"确诊：{'、'.join(newly_diagnosed)}")
+        if dead_names:
+            tick_parts.append(f"病亡：{'、'.join(dead_names)}")
+        if parts:
+            tick_parts.append("、".join(parts))
+        self._log("refugee", f"第{self.session.day}天 · 隔离检疫",
+                  "，".join(tick_parts), decision="例行检疫")
+
+    def _fail_refugee_intake(self, intake, reason):
+        """检疫失败（无幸存者）：按病亡人数扣信誉并清空安置。返回 (detail, False)。"""
+        verdict = self._end_verdict()
+        dead = intake.get("dead", [])
+        penalty = REFUGEE_REP_DEATH * max(1, len(dead))
+        rep_now = self._add_reputation(penalty)
+        self._bump_refugee_stats(quarantine_dead=len(dead))
+        detail = f"{reason}，信誉 {penalty:+d}（现 {rep_now}）"
+        self._log("refugee", "难民安置失败", f"{detail}。", decision="安置失败")
+        self._remember_refugee(detail, self._REF_ACT_SETTLE, token=intake.get("token"))
+        self.session.refugee_intake = None
+        self._check_end(forced_verdict=verdict)
+        return detail, False
+
+    def admit_refugees(self, assignments=None, token=None):
+        """接纳检疫期满的难民并分配岗位：结算信誉、联动医疗病例、新居民加入地堡。
+
+        assignments 为 {难民 key: 岗位}；缺省按难民擅长岗位（skill）分配。
+        未确诊的确诊疫病例须有救治中心床位承接（立即隔离，床位不足则登记待收治）；
+        体弱（低于巡检登记线）的非疫病例登记普通病例。无救治中心时确诊者
+        不建档（病例体系无承接），仅按当前健康加入。
+        """
+        self._require_daily_phase("接纳难民")
+        intake = self.session.refugee_intake
+        if not intake:
+            replay = self._refugee_replay(self._REF_ACT_ADMIT, token=token)
+            if replay[0] is not None:
+                return replay
+            # 安置已被并发的接纳/遣返清除：携带 token 的请求按状态过期处理（409），
+            # HTTP 层据此走 reconcile 安全回放；无凭据请求按"无待接纳难民"（400）
+            if token:
+                raise BunkerEngineConflict("难民安置状态已变化，请刷新后重试")
+            raise BunkerEngineError("当前没有待接纳的难民")
+        if token is not None and intake.get("token") and token != intake["token"]:
+            raise BunkerEngineConflict("难民安置状态已过期，请刷新后重试")
+        replay = self._refugee_replay(self._REF_ACT_ADMIT, token=intake.get("token"))
+        if replay[0] is not None:
+            return replay
+        if intake.get("status") != REFUGEE_ADMITTING:
+            raise BunkerEngineError("难民仍在隔离检疫中，检疫期满后才能接纳")
+        assignments = assignments or {}
+        alive = [p for p in intake.get("people", []) if p.get("alive")]
+        if not alive:
+            # 兜底：无幸存者直接按失败收敛，不留僵尸安置
+            return self._fail_refugee_intake(intake, reason="已无存活难民可接纳")
+        for p in alive:
+            job = assignments.get(p["key"])
+            if job is None:
+                job = p.get("skill", "general")
+            if job not in JOB_EFFICIENCY:
+                raise BunkerEngineError(f"{p['name']} 的分配岗位未知：{job}")
+            p["assigned_job"] = job
+
+        # 接纳前快照终局裁决（与贸易/援助交付同一口径）
+        verdict = self._end_verdict()
+        clinic = self._active_clinic()
+        cases = self._cases()
+        admitted_names = []
+        admitted_infectious = []
+        admitted_weak = []
+        # 先创建居民并 flush 取得 id，再按床位余量决定疫病例隔离/登记
+        new_residents = []
+        for p in alive:
+            r = Resident(
+                session_id=self.session.id,
+                name=p["name"],
+                job=p["assigned_job"],
+                health=_clamp(p["health"]),
+                morale=_clamp(p["morale"]),
+                alive=1,
+                joined_day=self.session.day,
+            )
+            self.session.residents.append(r)
+            self.db.add(r)
+            new_residents.append((p, r))
+        self.db.flush()  # 取得新居民 id
+        # 病例承接（病例簿在接纳时一次性写入）：确诊→优先隔离，床位不足转登记；
+        # 体弱非疫→登记普通病例。无救治中心则无病例体系承接
+        away = self._away_resident_ids()
+        for p, r in new_residents:
+            if clinic is None:
+                continue
+            if p["infectious"]:
+                # 已使用床位按当前病例簿实时计算（只计在堡病例，口径同 med_beds_used），
+                # 本批新加入的隔离病例逐人占用
+                used = sum(
+                    1 for c in cases
+                    if c.get("status") in MED_CARE_STATUSES
+                    and c.get("resident_id") not in away
+                )
+                status = MED_ISOLATED if used < self.med_bed_capacity() else MED_REGISTERED
+                case = self._build_case_dict(
+                    r, infectious=True, reason="跨聚落难民安置·检疫未转阴",
+                    kind="疫病", status=status,
+                )
+                cases.append(case)
+                admitted_infectious.append(r.name)
+            elif r.health < MED_AUTO_REGISTER_HEALTH:
+                cases.append(self._build_case_dict(
+                    r, infectious=False, reason="跨聚落难民安置·体弱", kind="伤病",
+                ))
+                admitted_weak.append(r.name)
+        if clinic is not None:
+            self._save_cases(cases)
+
+        n = len(new_residents)
+        self.session.survivors += n
+        rep_gain = REFUGEE_REP_ADMIT * n
+        rep_now = self._add_reputation(rep_gain)
+        for r in self.session.residents:
+            if r.alive:
+                r.morale = _clamp(r.morale + REFUGEE_ADMIT_MORALE)
+        self._bump_refugee_stats(admitted=n)
+        admitted_names = [r.name for _, r in new_residents]
+        parts = [
+            f"{n} 名难民正式加入地堡：{'、'.join(admitted_names)}",
+            f"信誉 {rep_gain:+d}（现 {rep_now}），全员士气 {REFUGEE_ADMIT_MORALE:+.0f}",
+        ]
+        if admitted_infectious:
+            parts.append(f"疫病例：{'、'.join(admitted_infectious)}")
+        if admitted_weak:
+            parts.append(f"体弱登记：{'、'.join(admitted_weak)}")
+        detail = "；".join(parts)
+        self._log("refugee", f"接纳难民·{intake['partner_name']}", detail, decision="接纳并分配岗位")
+        self._remember_refugee(detail, self._REF_ACT_ADMIT, token=intake.get("token"))
+        self.session.refugee_intake = None
+        self._check_end(forced_verdict=verdict)
+        return detail, False
+
+    def repatriate_refugees(self, token=None):
+        """检疫期满后遣返全部待接纳难民：人道代价，信誉与在堡士气受挫。"""
+        self._require_daily_phase("遣返难民")
+        intake = self.session.refugee_intake
+        if not intake:
+            replay = self._refugee_replay(self._REF_ACT_REPATRIATE, token=token)
+            if replay[0] is not None:
+                return replay
+            if token:
+                raise BunkerEngineConflict("难民安置状态已变化，请刷新后重试")
+            raise BunkerEngineError("当前没有待处置的难民")
+        if token is not None and intake.get("token") and token != intake["token"]:
+            raise BunkerEngineConflict("难民安置状态已过期，请刷新后重试")
+        replay = self._refugee_replay(
+            self._REF_ACT_REPATRIATE, token=intake.get("token")
+        )
+        if replay[0] is not None:
+            return replay
+        if intake.get("status") != REFUGEE_ADMITTING:
+            raise BunkerEngineError("隔离检疫期间无法遣返，请待检疫结束后处置")
+        alive = [p for p in intake.get("people", []) if p.get("alive")]
+        names = "、".join(p["name"] for p in alive)
+        rep_now = self._add_reputation(REFUGEE_REP_REPATRIATE)
+        for r in self._in_bunker_residents():
+            r.morale = _clamp(r.morale + REFUGEE_REPATRIATE_MORALE)
+        self._bump_refugee_stats(repatriated=len(alive))
+        detail = (
+            f"遣返 {names}（共 {len(alive)} 人），信誉 {REFUGEE_REP_REPATRIATE:+d}"
+            f"（现 {rep_now}），在堡全员士气 {REFUGEE_REPATRIATE_MORALE:+.0f}"
+        )
+        self._log("refugee", f"遣返难民·{intake['partner_name']}", detail, decision="遣返")
+        self._remember_refugee(detail, self._REF_ACT_REPATRIATE, token=intake.get("token"))
+        self.session.refugee_intake = None
+        return detail, False
+
+    def reconcile_stale_refugee(self, action, token=None):
+        """并发落败后核对难民安置动作：同一次动作安全回放，否则 409。"""
+        replay = self._refugee_replay(action, token=token)
+        if replay[0] is not None:
+            return replay
+        # 接纳/遣返并发时落败方的安置已被对方动作（或检疫失败自动收敛）清除：
+        # 只要档案级凭据仍挂着同一个安置 token，就回放那次处置明细，
+        # 落败方同样拿到 200，绝不二次结算
+        rec = self.session.last_refugee
+        if token and rec and rec.get("token") == token and rec.get("action") in (
+            self._REF_ACT_ADMIT, self._REF_ACT_REPATRIATE, self._REF_ACT_SETTLE,
+        ):
+            return rec.get("detail", ""), True
+        raise BunkerEngineConflict("难民安置状态已被其他请求更新，请刷新后重试")
+
     # ---- 医疗救治中心 ----
     # 病例状态链：
     #   registered 登记：病例已建档但尚未收治（无床位/未安排），健康持续恶化；
@@ -2874,6 +3417,8 @@ class BunkerEngine:
         self.session.status = "win" if win else "over"
         # 进入终局后不存在悬而未决的抉择/在外队伍/在途订单，状态机统一收敛到 ended
         self._clear_all_pending()
+        # 在检/待接纳难民随终局关闭：终局只统计正式居民，不留僵尸安置
+        self.session.refugee_intake = None
         alive = [r for r in self.session.residents if r.alive]
         # 计分：幸存者 * 天数 * 士气系数
         morale = self.avg_morale()
@@ -2889,6 +3434,7 @@ class BunkerEngine:
             "day": self.session.day,
             "avg_health": avg_health,
             "medical": med_stats,
+            "refugee": self.refugee_stats(),
         }
         if med_stats["total"]:
             self._log(
@@ -2922,6 +3468,15 @@ AID_PARTNERS = [
     {"key": "valley",  "name": "幽谷定居点",   "distance": 2, "favor": FOOD},
     {"key": "foundry", "name": "铸铁要塞",     "distance": 3, "favor": POWER},
     {"key": "spring",  "name": "甘泉营地",     "distance": 4, "favor": WATER},
+]
+
+# 申请难民安置的外部聚落（难民来源地，多为疫区周边的流民中转站）。
+# 安置在堡内隔离舱完成，无押运路程：公告板每日轮换，批准即开始检疫
+REFUGEE_PARTNERS = [
+    {"key": "ridge",   "name": "岭北流民站"},
+    {"key": "dock",    "name": "旧港难民营"},
+    {"key": "station", "name": "变电站收容点"},
+    {"key": "dome",    "name": "七号穹顶外缘"},
 ]
 
 

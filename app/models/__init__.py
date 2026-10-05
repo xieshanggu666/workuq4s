@@ -66,6 +66,17 @@ class GameSession(Base):
     # 地堡医疗危机 0-100：随在堡活跃病例累积，联盟援助成功缓解、失败激化；
     # 越过高压阈值后在堡全员士气持续受挫
     medical_crisis = Column(Integer, nullable=False, default=0)
+    # 跨聚落难民安置快照（含一次性 token、来源聚落、隔离检疫进度与每名难民的
+    # 健康/士气/接触史/确诊/擅长岗位），落库后刷新可恢复同一批安置；
+    # 为 None 表示当前没有在处理的难民申请。
+    # 状态链：quarantine(隔离检疫) → admitting(检疫结束待接纳分配岗位)
+    #         接纳后难民转为正式居民，遣返/检疫失败则关闭
+    refugee_intake = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 最近一次难民安置动作（批准/拒绝/接纳/遣返）的幂等凭据，
+    # 作用与 last_trade / last_aid 相同：连点/并发落败安全回放，不重复结算
+    last_refugee = Column(JSON, nullable=True)
+    # 难民安置累计统计：申请/批准/接纳/遣返/拒绝/检疫病亡人数，终局随 outcome 归档
+    refugee_stats = Column(MutableDict.as_mutable(JSON), nullable=True)
     # 医疗救治中心病例簿：每名居民的病例经历 登记→治疗/隔离→康复/病亡。
     # 活跃病例驱动每日医疗结算（床位占用/物资消耗/传染扩散），终态病例作为
     # 危机后健康结算履历保留至终局。引擎以"深拷贝整体回写"（_save_cases）

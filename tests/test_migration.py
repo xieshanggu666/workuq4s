@@ -559,3 +559,115 @@ def test_valid_medical_cases_left_untouched(db):
     db.expire_all()
     kept = db.get(GameSession, sid).medical_cases
     assert {c["id"] for c in kept} == {"c1", "c2"}
+
+
+# ---- 跨聚落难民安置列与快照归一化 ----
+
+def test_backfills_refugee_columns(db):
+    """缺列旧表经 ensure_schema 后补齐 refugee_intake/last_refugee/refugee_stats。"""
+    gs = make_session(db)
+    db.commit()
+    db.expire_all()
+    db.execute(text("ALTER TABLE game_sessions RENAME TO gs_old"))
+    db.execute(text(
+        "CREATE TABLE game_sessions ("
+        "id INTEGER PRIMARY KEY, name VARCHAR(64), day INTEGER, target_day INTEGER, "
+        "status VARCHAR(16), resources JSON, survivors INTEGER, outcome JSON, "
+        "score INTEGER, created_at DATETIME, updated_at DATETIME)"
+    ))
+    db.execute(text(
+        "INSERT INTO game_sessions SELECT id,name,day,target_day,status,resources,"
+        "survivors,outcome,score,created_at,updated_at FROM gs_old"
+    ))
+    db.execute(text("DROP TABLE gs_old"))
+    db.commit()
+
+    ensure_schema(engine)
+    db.expire_all()
+    row = db.query(GameSession).first()
+    assert row.refugee_intake is None
+    assert row.last_refugee is None
+    assert row.refugee_stats is None
+
+
+def test_corrupt_refugee_intake_is_cleared(db):
+    """结构损坏/非法状态/无 token 的难民安置快照：清空，不阻塞每日推进。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    bad = [
+        "not-a-dict",
+        {"status": "quarantine", "people": []},                       # 无 token
+        {"token": "t", "status": "unknown", "people": []},            # 非法状态
+        {"token": "t", "status": "quarantine", "people": "not-list"}, # people 非列表
+        {"token": "t", "status": "quarantine",
+         "people": [{"name": "无名"}]},                                # 缺 key/name
+    ]
+    for raw in bad:
+        db.execute(
+            text("UPDATE game_sessions SET refugee_intake = :r WHERE id = :sid"),
+            {"r": json.dumps(raw, ensure_ascii=False), "sid": sid},
+        )
+        db.commit()
+        assert reconcile_old_saves(engine) == 1
+        db.expire_all()
+        assert db.get(GameSession, sid).refugee_intake is None
+
+
+def test_intake_with_no_alive_refugee_is_cleared(db):
+    """全部难民已死亡的安置快照：归一化清除。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    intake = {"token": "t", "status": "admitting", "people": [
+        {"key": "p1", "name": "甲", "alive": False},
+    ]}
+    db.execute(
+        text("UPDATE game_sessions SET refugee_intake = :r WHERE id = :sid"),
+        {"r": json.dumps(intake, ensure_ascii=False), "sid": sid},
+    )
+    db.commit()
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    assert db.get(GameSession, sid).refugee_intake is None
+
+
+def test_valid_refugee_intake_left_untouched(db):
+    """结构完整的安置快照：归一化零改写。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    intake = {"token": "t", "status": "quarantine", "elapsed": 1,
+              "partner_name": "岭北流民站",
+              "people": [{"key": "p1", "name": "甲", "health": 60,
+                          "exposed": True, "infectious": False, "alive": True}]}
+    db.execute(
+        text("UPDATE game_sessions SET refugee_intake = :r WHERE id = :sid"),
+        {"r": json.dumps(intake, ensure_ascii=False), "sid": sid},
+    )
+    db.commit()
+    assert reconcile_old_saves(engine) == 0
+    db.expire_all()
+    kept = db.get(GameSession, sid).refugee_intake
+    assert kept["token"] == "t"
+    assert kept["people"][0]["name"] == "甲"
+
+
+def test_ended_save_clears_refugee_intake(db):
+    """已结束档案残留的难民安置快照：归一化后清空，收敛到 ended。"""
+    gs = make_session(db)
+    gs.status = "win"
+    db.commit()
+    sid = gs.id
+    intake = {"token": "t", "status": "admitting",
+              "people": [{"key": "p1", "name": "甲", "alive": True}]}
+    db.execute(
+        text("UPDATE game_sessions SET refugee_intake = :r WHERE id = :sid"),
+        {"r": json.dumps(intake, ensure_ascii=False), "sid": sid},
+    )
+    db.commit()
+    reconcile_old_saves(engine)
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.refugee_intake is None
+    assert BunkerEngine(db, fixed).phase == "ended"

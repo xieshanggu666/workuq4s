@@ -735,3 +735,195 @@ def test_aid_cancel_http_refund(client):
     r2 = client.post(f"/api/sessions/{sid}/aid/cancel", json={"token": token})
     assert r2.status_code == 200
     assert r2.json()["aid_pact"] is None
+
+
+# ---- 跨聚落难民安置 HTTP 端到端 ----
+
+def test_refugee_board_endpoint(client):
+    """难民公告板只读端点：返回当日两份安置申请。"""
+    r = client.post("/api/sessions", json={"name": "ref"})
+    sid = r.json()["id"]
+    r = client.get(f"/api/sessions/{sid}/refugee/board")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["day"] == 1
+    assert body["reputation"] == 50
+    assert body["active"] is False
+    assert len(body["applications"]) == 2
+    app = body["applications"][0]
+    assert 1 <= app["count"] <= 3
+    assert set(app["daily_cost"]) == {"food", "water", "power"}
+    assert len(app["people"]) == app["count"]
+
+
+def _seed_refugee_intake(sid, people, status="quarantine", elapsed=0, build_clinic=False):
+    """在独立 DB 会话中直接写入难民安置快照（HTTP 测试前置布置）。"""
+    import uuid
+    db = SessionLocal()
+    try:
+        gs = db.get(GameSession, sid)
+        eng = BunkerEngine(db, gs)
+        if build_clinic and not any(f.category == "clinic" for f in gs.facilities):
+            from app.services.engine import FACILITY_ZH as _FZ
+            from app.models import Facility as _F
+            db.add(_F(session_id=gs.id, name=_FZ["clinic"], category="clinic",
+                      level=1, status="active", built_day=gs.day))
+        gs.refugee_intake = {
+            "token": uuid.uuid4().hex,
+            "application_id": "rf-seed-1",
+            "partner": "ridge",
+            "partner_name": "岭北流民站",
+            "status": status,
+            "applied_day": gs.day,
+            "elapsed": elapsed,
+            "people": [dict(p) for p in people],
+            "dead": [],
+        }
+        stats = dict(gs.refugee_stats or {})
+        stats["applications"] = int(stats.get("applications", 0)) + 1
+        stats["accepted"] = int(stats.get("accepted", 0)) + len(people)
+        gs.refugee_stats = stats
+        db.commit()
+    finally:
+        db.close()
+
+
+def _healthy_refugee(key, name, skill="general"):
+    return {
+        "key": key, "name": name, "health": 80.0, "morale": 65.0,
+        "exposed": False, "infectious": False, "skill": skill, "alive": True,
+    }
+
+
+def test_refugee_full_flow_http(client, monkeypatch):
+    """批准（HTTP）→ 检疫 2 天 → 接纳分配岗位：状态链、人口与信誉 HTTP 走通。"""
+    from app.services import engine as engine_mod
+
+    class QuietRand:
+        def random(self):
+            return 0.9  # 不触发危机、接触史不确诊
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    monkeypatch.setattr(engine_mod, "_rng", lambda: QuietRand())
+
+    r = client.post("/api/sessions", json={"name": "ref-flow"})
+    sid = r.json()["id"]
+    # 经 HTTP 批准当日公告板的第一份申请（状态链起点走真实端点）
+    board = client.get(f"/api/sessions/{sid}/refugee/board").json()
+    app = board["applications"][0]
+    r = client.post(f"/api/sessions/{sid}/refugee/accept",
+                    json={"application_id": app["id"]})
+    assert r.status_code == 200
+    state = r.json()
+    assert state["refugee_intake"]["status"] == "quarantine"
+    n = len([p for p in state["refugee_intake"]["people"] if p["alive"]])
+
+    # 推进两天：检疫期满（接触史难民在 0.9 随机下均不确诊；病亡与否不计入人口）
+    client.post(f"/api/sessions/{sid}/advance")
+    state = client.post(f"/api/sessions/{sid}/advance").json()["session"]
+    assert state["refugee_intake"]["status"] == "admitting"
+    token = state["refugee_intake"]["token"]
+    alive_keys = [p["key"] for p in state["refugee_intake"]["people"] if p["alive"]]
+    survivors_before = state["survivors"]
+    rep_before = state["reputation"]
+
+    # 接纳：全部派为杂工
+    assignments = {k: "general" for k in alive_keys}
+    r = client.post(f"/api/sessions/{sid}/refugee/admit",
+                    json={"assignments": assignments, "token": token})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["refugee_intake"] is None
+    assert body["survivors"] == survivors_before + len(alive_keys)
+    assert body["reputation"] == rep_before + 4 * len(alive_keys)
+    assert body["refugee_summary"]["stats"]["admitted"] == len(alive_keys)
+    new_jobs = {x["name"]: x["job"] for x in body["residents"] if x["joined_day"] == body["day"]}
+    assert all(j == "general" for j in new_jobs.values())
+    assert len(new_jobs) == len(alive_keys)
+    assert n >= 1
+
+
+def test_refugee_reject_http_penalty(client):
+    """拒绝申请：信誉 -2，不产生安置快照。"""
+    r = client.post("/api/sessions", json={"name": "ref-rej"})
+    sid = r.json()["id"]
+    board = client.get(f"/api/sessions/{sid}/refugee/board").json()
+    app = board["applications"][0]
+    r = client.post(f"/api/sessions/{sid}/refugee/reject",
+                    json={"application_id": app["id"]})
+    assert r.status_code == 200
+    assert r.json()["refugee_intake"] is None
+    assert r.json()["reputation"] == 48
+    assert r.json()["refugee_summary"]["stats"]["rejected"] == app["count"]
+
+
+def test_refugee_repatriate_http(client, monkeypatch):
+    """检疫期满遣返：信誉 -5、人口不变；连点幂等回放。"""
+    from app.services import engine as engine_mod
+
+    class QuietRand:
+        def random(self):
+            return 0.9
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    monkeypatch.setattr(engine_mod, "_rng", lambda: QuietRand())
+
+    r = client.post("/api/sessions", json={"name": "ref-rep"})
+    sid = r.json()["id"]
+    _seed_refugee_intake(sid, [_healthy_refugee("h1", "流民乙")])
+    client.post(f"/api/sessions/{sid}/advance")
+    state = client.post(f"/api/sessions/{sid}/advance").json()["session"]
+    assert state["refugee_intake"]["status"] == "admitting"
+    token = state["refugee_intake"]["token"]
+    survivors_before = state["survivors"]
+
+    r = client.post(f"/api/sessions/{sid}/refugee/repatriate", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["refugee_intake"] is None
+    assert body["survivors"] == survivors_before
+    assert body["reputation"] == 45
+    assert body["refugee_summary"]["stats"]["repatriated"] == 1
+    # 携带 token 的连点：安置已清除，reconcile 回放 200
+    r2 = client.post(f"/api/sessions/{sid}/refugee/admit",
+                     json={"assignments": {}, "token": token})
+    assert r2.status_code == 200
+
+
+def test_refugee_admit_infectious_links_medical_case_http(client, monkeypatch):
+    """接纳未转阴难民：立即建立隔离病例，medical_cases 可查。"""
+    from app.services import engine as engine_mod
+
+    class QuietRand:
+        def random(self):
+            return 0.9
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    monkeypatch.setattr(engine_mod, "_rng", lambda: QuietRand())
+
+    r = client.post("/api/sessions", json={"name": "ref-med"})
+    sid = r.json()["id"]
+    assert client.post(f"/api/sessions/{sid}/build", json={"category": "clinic"}).status_code == 200
+    _seed_refugee_intake(sid, [{
+        "key": "sick1", "name": "带病流民", "health": 40.0, "morale": 55.0,
+        "exposed": True, "infectious": True, "skill": "general", "alive": True,
+    }], build_clinic=False)
+    client.post(f"/api/sessions/{sid}/advance")
+    state = client.post(f"/api/sessions/{sid}/advance").json()["session"]
+    assert state["refugee_intake"]["status"] == "admitting"
+    token = state["refugee_intake"]["token"]
+    r = client.post(f"/api/sessions/{sid}/refugee/admit",
+                    json={"assignments": {"sick1": "general"}, "token": token})
+    assert r.status_code == 200
+    case = next(c for c in r.json()["medical_cases"] if c["resident_name"] == "带病流民")
+    assert case["infectious"] is True
+    assert case["status"] == "isolated"
+    me = next(x for x in r.json()["residents"] if x["name"] == "带病流民")
+    assert me["case_status"] == "isolated"
+    assert me["case_infectious"] == 1
