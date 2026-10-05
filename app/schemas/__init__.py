@@ -36,6 +36,8 @@ class ResidentOut(BaseModel):
     trade_status: Optional[str] = None
     # 联盟援助协议角色：escorting=在途援助押运；proposed=待出发押运；None=无协议
     aid_status: Optional[str] = None
+    # 跨聚落难民安置：quarantining=入境检疫区观察中（已建档居民但尚未接纳）
+    refugee_status: Optional[str] = None
     joined_day: int
 
     class Config:
@@ -84,6 +86,10 @@ class SessionDetail(BaseModel):
     trade_order: Optional[Dict[str, Any]] = None
     # 当前地堡联盟援助协议快照（待签约/押运在途），终局后清空
     aid_pact: Optional[Dict[str, Any]] = None
+    # 当前跨聚落难民安置申请快照（检疫观察中），接纳/回绝后清空
+    refugee_petition: Optional[Dict[str, Any]] = None
+    # 难民安置面板概览（检疫区人数/天数/每日消耗/确诊筛查）
+    refugee_summary: Optional[Dict[str, Any]] = None
     # 医疗救治中心病例簿（登记/治疗/隔离/康复/病亡全履历）与床位概览
     medical_cases: Optional[List[Dict[str, Any]]] = None
     medical_summary: Optional[Dict[str, Any]] = None
@@ -165,6 +171,14 @@ class AidIncidentChoice(BaseModel):
 
 class AidCancel(BaseModel):
     """签约前（proposed）撤回协议。"""
+    token: Optional[str] = None
+
+
+class RefugeeReview(BaseModel):
+    """地堡审核外部聚落提交的难民安置申请：approve=True 时须逐人指定接纳岗位。"""
+    petition_id: str
+    approve: bool
+    jobs: Optional[List[str]] = None
     token: Optional[str] = None
 
 

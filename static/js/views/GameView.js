@@ -27,6 +27,12 @@ window.GameView = {
       aidRequest: null,
       aidSignerId: null,
       aidEscorts: [],
+      // 跨聚落难民安置
+      refugeeBoard: null,
+      refugeeBoardLoading: false,
+      showRefugeeDialog: false,
+      refugeePetition: null,
+      refugeeJobs: [],
       // 医疗救治中心
       medRegistering: {},
     };
@@ -335,6 +341,52 @@ window.GameView = {
       const r = this.s.residents.find(x => x.id === this.s.aid_pact.signer_id);
       return r ? r.name : (this.s.aid_pact.signer_name || "?");
     },
+    // ---- 跨聚落难民安置 ----
+    async openRefugeeBoard() {
+      this.error = "";
+      this.refugeeBoardLoading = true;
+      try {
+        this.refugeeBoard = await Api.get(`/api/sessions/${this.sid}/refugee/board`);
+        this.showRefugeeDialog = true;
+      } catch (e) { this.error = e.message; }
+      finally { this.refugeeBoardLoading = false; }
+    },
+    pickRefugeePetition(p) {
+      this.refugeePetition = p;
+      // 默认全部安排为杂工，玩家可逐人改为其他岗位
+      this.refugeeJobs = (p.people || []).map(() => "general");
+    },
+    async submitRefugeeReview(approve) {
+      this.error = "";
+      if (!this.refugeePetition) { this.error = "请选择一份安置申请"; return; }
+      if (approve && this.refugeeJobs.length !== this.refugeePetition.head) {
+        this.error = "必须为每名难民指定岗位"; return;
+      }
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/refugee/review`, {
+          petition_id: this.refugeePetition.id,
+          approve,
+          jobs: approve ? this.refugeeJobs : null,
+        });
+        this.showRefugeeDialog = false;
+        this.refugeePetition = null;
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    fmtRefugeeCost(bag) {
+      return Object.entries(bag || {}).map(([k, v]) =>
+        `${{food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] || k} ${Math.round(v)}`
+      ).join("、");
+    },
+    refugeePeopleRows() {
+      // 检疫区难民与居民档案联表，供面板展示健康/状态
+      if (!this.s || !this.s.refugee_petition) return [];
+      return (this.s.refugee_petition.people || []).map(p => ({
+        ...p,
+        resident: this.s.residents.find(r => r.id === p.resident_id) || null,
+      }));
+    },
     // ---- 医疗救治中心 ----
     medCaseOf(rid) {
       const cases = (this.s && this.s.medical_cases) || [];
@@ -404,6 +456,17 @@ window.GameView = {
     aidPending() {
       return !!(this.s && this.s.aid_pact && this.s.aid_pact.pending_incident);
     },
+    refugeeActive() {
+      // 检疫观察中的安置申请（已批准入境、尚未完成接纳）
+      return !!(this.s && this.s.refugee_petition
+        && this.s.refugee_petition.status === "quarantining");
+    },
+    refugeeSummary() {
+      return (this.s && this.s.refugee_summary) || { head: 0, deaths: 0, daily_cost: {} };
+    },
+    quarantineResidents() {
+      return this.s ? this.s.residents.filter(r => r.refugee_status === "quarantining") : [];
+    },
     // 可会签的医护负责人：在堡、存活、无未结病例
     aidEligibleMedics() {
       return this.inBunkerAlive.filter(r => r.job === "medic" && !r.case_status);
@@ -424,7 +487,10 @@ window.GameView = {
       return "";
     },
     inBunkerAlive() {
-      return this.s ? this.s.residents.filter(r => r.alive && !r.away) : [];
+      // 在堡且可参与地堡生活：排除离堡队伍成员与入境检疫区难民
+      return this.s
+        ? this.s.residents.filter(r => r.alive && !r.away && r.refugee_status !== "quarantining")
+        : [];
     },
     expMemberCount() {
       // 只统计档案中仍在编制内的成员，兼容旧快照里夹杂已移除编号的情况
@@ -482,6 +548,7 @@ window.GameView = {
         <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ expMemberCount }})</template></button>
         <button :class="{ active: tab==='trade' }" @click="tab='trade'">贸易救援<template v-if="s.trade_order"> ●</template></button>
         <button :class="{ active: tab==='aid' }" @click="tab='aid'">联盟援助<template v-if="s.aid_pact"> ●</template></button>
+        <button :class="{ active: tab==='refugee' }" @click="tab='refugee'">难民安置<template v-if="refugeeActive"> ({{ quarantineResidents.length }})</template></button>
         <button :class="{ active: tab==='medical' }" @click="tab='medical'">医疗救治<template v-if="medActiveCount"> ({{ medActiveCount }})</template></button>
         <button :class="{ active: tab==='build' }" @click="tab='build'">设施扩建</button>
         <button :class="{ active: tab==='log' }" @click="tab='log'">大事记</button>
@@ -507,20 +574,20 @@ window.GameView = {
 
       <!-- 幸存者 -->
       <div v-if="tab==='residents'">
-        <div v-for="r in s.residents" :key="r.id" class="person" :class="{ dead: !r.alive, away: r.away }">
+        <div v-for="r in s.residents" :key="r.id" class="person" :class="{ dead: !r.alive, away: r.away, quarantine: r.refugee_status==='quarantining' }">
           <div class="p-avatar">{{ r.name[0] }}</div>
           <div class="p-info">
             <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span>
               <span v-if="r.case_status" class="chip med-tag" :class="r.case_status">
                 {{ r.case_infectious ? '疫' : '病' }}·{{ caseStatusZh(r.case_status) }}
               </span>
-              <span v-if="r.away" class="chip away-tag">{{ r.trade_status === 'transporting' ? '贸易押运中' : r.aid_status === 'escorting' ? '援助押运中' : '探索中' }}</span><span v-if="r.trade_status==='reviewing'" class="chip review-tag">待押运</span><span v-if="r.aid_status==='proposed'" class="chip review-tag">待援助押运</span>
+              <span v-if="r.away" class="chip away-tag">{{ r.trade_status === 'transporting' ? '贸易押运中' : r.aid_status === 'escorting' ? '援助押运中' : '探索中' }}</span><span v-if="r.trade_status==='reviewing'" class="chip review-tag">待押运</span><span v-if="r.aid_status==='proposed'" class="chip review-tag">待援助押运</span><span v-if="r.refugee_status==='quarantining'" class="chip review-tag">入境检疫中</span>
             </div>
             <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: r.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(r.health) }}</b></div>
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
           </div>
           <div class="p-actions" v-if="r.alive && s.status==='running'">
-            <select :value="r.job" :disabled="actionLocked || r.away || !!r.case_status" @change="assignJob(r.id, $event.target.value)">
+            <select :value="r.job" :disabled="actionLocked || r.away || !!r.case_status || r.refugee_status==='quarantining'" @change="assignJob(r.id, $event.target.value)">
               <option value="engineer">工程师</option>
               <option value="farmer">农民</option>
               <option value="medic">医护</option>
@@ -662,6 +729,70 @@ window.GameView = {
         </div>
       </div>
 
+      <!-- 跨聚落难民安置 -->
+      <div v-if="tab==='refugee'">
+        <div class="exp-panel">
+          <div class="med-head">
+            <span class="chip rep">地堡信誉 {{ s.reputation }}</span>
+            <span class="chip" :class="s.medical_crisis >= medCrisisHigh ? 'over' : 'reviewing'">
+              医疗危机 {{ s.medical_crisis }} / {{ medCrisisHigh }} 高压线
+            </span>
+          </div>
+          <!-- 无在检疫申请：查看外部聚落提交的安置申请 -->
+          <div v-if="!s.refugee_petition" class="exp-empty">
+            <p>地表的外部聚落会把流离失所者送来地堡申请安置。地堡需要逐份<b>审核</b>：
+               批准入境先一次性消耗洗消安置物资，难民即刻建档并进入<b>检疫区</b>观察
+               3 天——检疫区按人每日消耗食物、水源、电力与氧气，当值医护能提高潜藏疫病的
+               筛查率；检疫期满，无疫者按你分配的<b>岗位</b>正式入列，检疫确诊者则
+               转入<b>隔离病例</b>由医疗救治中心承接。</p>
+            <p class="dim">接纳健康难民提升信誉与全员士气；检疫确诊会抬升医疗危机、压低士气，
+               检疫中病亡还会折损信誉；回绝申请虽不费物资，但见死不救同样降低口碑。
+               申请与探索队/贸易/援助互斥（同一时间只办理一宗对外事务）。</p>
+            <button class="btn primary" :disabled="s.status!=='running' || actionLocked || !!s.expedition || !!s.trade_order || !!s.aid_pact"
+                    @click="openRefugeeBoard">
+              {{ refugeeBoardLoading ? '接收通讯中…' : '查收难民安置申请' }}
+            </button>
+            <div v-if="s.expedition || s.trade_order || s.aid_pact" class="dim" style="margin-top:8px">
+              探索队/贸易订单/援助协议在外期间无法办理难民安置
+            </div>
+          </div>
+          <!-- 检疫中的申请 -->
+          <div v-else class="exp-status">
+            <div class="exp-row">
+              <span class="k">状态</span>
+              <span class="v">
+                <span class="chip reviewing">入境检疫中</span>
+                <b style="margin-left:8px">难民安置 · {{ s.refugee_petition.partner_name }}</b>
+              </span>
+            </div>
+            <div class="exp-row">
+              <span class="k">检疫进度</span>
+              <span class="v">第 {{ s.refugee_petition.elapsed_days }} / {{ s.refugee_petition.quarantine_days }} 天
+                · 在检 {{ refugeeSummary.head }} 人<template v-if="refugeeSummary.deaths"> · 病亡 {{ refugeeSummary.deaths }} 人</template></span>
+            </div>
+            <div class="exp-row">
+              <span class="k">检疫区每日消耗</span>
+              <span class="v">{{ fmtRefugeeCost(refugeeSummary.daily_cost) }}</span>
+            </div>
+            <div class="exp-row">
+              <span class="k">检疫名单</span>
+              <span class="v">
+                <span v-for="p in refugeePeopleRows()" :key="p.resident_id" class="chip"
+                      style="margin:2px"
+                      :class="!p.alive ? 'rejected' : p.detected ? 'isolated' : 'reviewing'">
+                  {{ p.name }}·{{ {engineer:'工程师',farmer:'农民',medic:'医护',general:'杂工'}[p.job] }}
+                  <template v-if="!p.alive">（病亡）</template>
+                  <template v-else-if="p.detected">（检疫确诊）</template>
+                </span>
+              </span>
+            </div>
+            <div class="exp-actions">
+              <span class="dim">推进一天以继续检疫观察；期满当日自动完成终检、接纳与岗位入列</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- 医疗救治中心 -->
       <div v-if="tab==='medical'">
         <div class="exp-panel">
@@ -680,6 +811,7 @@ window.GameView = {
               <span class="chip">床位 {{ s.medical_summary.beds_used }} / {{ s.medical_summary.bed_capacity }}</span>
               <span class="chip registered">待收治 {{ s.medical_summary.registered }}</span>
               <span class="chip reviewing">隔离中 {{ s.medical_summary.isolated }}</span>
+              <span v-if="s.medical_summary.quarantine" class="chip review-tag">入境检疫 {{ s.medical_summary.quarantine }} 人</span>
               <span class="chip" :class="s.medical_crisis >= medCrisisHigh ? 'over' : 'rescue'">
                 医疗危机 {{ s.medical_crisis }}<template v-if="s.medical_crisis >= medCrisisHigh"> · 高压</template>
               </span>
@@ -708,7 +840,7 @@ window.GameView = {
                       <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: r.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(r.health) }}</b></div>
                       <div class="dim">{{ c.reason }} · 第 {{ c.open_day }} 天登记<span v-if="c.days_cared"> · 已救治 {{ c.days_cared }} 床日</span></div>
                     </div>
-                    <div class="mc-actions" v-if="s.status==='running' && !r.away">
+                    <div class="mc-actions" v-if="s.status==='running' && !r.away && r.refugee_status!=='quarantining'">
                       <button class="btn tiny primary" :disabled="actionLocked"
                               @click="admitCase(r.id, 'treating')">
                         {{ c.status === 'treating' ? '治疗中' : '转入治疗' }}
@@ -933,6 +1065,74 @@ window.GameView = {
               <strong>{{ loading ? '签约中…' : '管理者发起 · 三方签约并冻结托管' }}</strong>
             </button>
             <button class="choice" @click="aidRequest=null"><strong>返回请求列表</strong></button>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- 跨聚落难民安置公告板弹层 -->
+    <div v-if="showRefugeeDialog" class="overlay">
+      <div class="crisis aid market-dialog">
+        <h2>🏚️ 跨聚落难民安置申请</h2>
+        <p class="crisis-desc">第 {{ refugeeBoard.day }} 天收到的申请（每日轮换）。当前信誉 <b>{{ refugeeBoard.reputation }}</b>。
+          申请中是否有人潜藏疫病无从预知，只能靠入境检疫筛查。</p>
+        <template v-if="!refugeePetition">
+          <div class="market-list">
+            <div v-for="p in refugeeBoard.petitions" :key="p.id" class="market-offer aid-offer" @click="pickRefugeePetition(p)">
+              <div class="mo-head">
+                <span class="chip reviewing">安置申请</span>
+                <strong>{{ p.partner_name }}</strong>
+                <span class="dim">{{ p.head }} 人 · 检疫 {{ p.quarantine_days }} 天</span>
+              </div>
+              <div class="mo-flow">
+                <span v-for="(x, i) in p.people" :key="i" class="chip" style="margin:2px">
+                  {{ x.name }}<span class="dim"> {{ x.age }}岁</span>
+                </span>
+              </div>
+              <div class="dim">{{ p.summary }}</div>
+              <div class="dim">入境洗消人均 {{ fmtRefugeeCost(p.intake_cost) }}；检疫期人均每日 {{ fmtRefugeeCost(p.quarantine_cost) }}</div>
+            </div>
+          </div>
+          <div class="choices">
+            <button class="choice" @click="showRefugeeDialog=false"><strong>关闭</strong></button>
+          </div>
+        </template>
+        <template v-else>
+          <div class="market-offer aid-offer">
+            <div class="mo-head">
+              <span class="chip reviewing">安置申请</span>
+              <strong>{{ refugeePetition.partner_name }}</strong>
+              <span class="dim">{{ refugeePetition.head }} 人 · 检疫 {{ refugeePetition.quarantine_days }} 天</span>
+            </div>
+            <div class="dim">{{ refugeePetition.summary }}</div>
+            <div class="dim">入境洗消一次性 {{ fmtRefugeeCost({
+              food: Math.round(refugeePetition.intake_cost.food * refugeePetition.head),
+              water: Math.round(refugeePetition.intake_cost.water * refugeePetition.head),
+              power: Math.round(refugeePetition.intake_cost.power * refugeePetition.head),
+            }) }}；检疫期每日另按人消耗物资。</div>
+          </div>
+
+          <p class="dim" style="margin:10px 0 4px">为每名难民指定检疫期满后的接纳岗位（工程师 / 农民 / 医护 / 杂工）：</p>
+          <div class="exp-member-pick">
+            <div v-for="(x, i) in refugeePetition.people" :key="i" class="exp-member" style="min-width:220px">
+              <span class="p-avatar">{{ x.name[0] }}</span>
+              <span>{{ x.name }} <span class="dim">{{ x.age }}岁</span></span>
+              <select v-model="refugeeJobs[i]" :disabled="loading">
+                <option value="general">杂工</option>
+                <option value="engineer">工程师</option>
+                <option value="farmer">农民</option>
+                <option value="medic">医护</option>
+              </select>
+            </div>
+          </div>
+          <div class="choices">
+            <button class="choice primary-choice" :disabled="loading" @click="submitRefugeeReview(true)">
+              <strong>{{ loading ? '办理中…' : '批准入境 · 洗消并检疫 ' + refugeePetition.quarantine_days + ' 天' }}</strong>
+            </button>
+            <button class="choice danger" :disabled="loading" @click="submitRefugeeReview(false)">
+              <strong>回绝申请（信誉 -5）</strong>
+            </button>
+            <button class="choice" @click="refugeePetition=null"><strong>返回申请列表</strong></button>
           </div>
         </template>
       </div>

@@ -63,6 +63,15 @@ class GameSession(Base):
     # 最近一次联盟援助动作（途中事件抉择/押运审核/交付/失败回退/撤约）的
     # 幂等凭据，作用与 last_trade 相同
     last_aid = Column(JSON, nullable=True)
+    # 跨聚落难民安置申请快照（外部聚落提交 → 地堡审核 → 入境检疫 → 接纳）。
+    # 审核动作（批准/回绝）在每日阶段即时完成，故快照只承载"已批准、检疫中"
+    # 的申请：含一次性 token、来源聚落、检疫难民（已建档居民编号、岗位、
+    # 感染/确诊标记）、检疫天数与病亡名单；为 None 表示当前没有在检疫的申请。
+    # 状态：quarantining(检疫观察) → 接纳后清除（终态 admitted/rejected 只写凭据/日志）
+    refugee_petition = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 最近一次难民安置动作（审核批准/回绝、检疫接纳）的幂等凭据，
+    # 作用与 last_trade / last_aid 相同
+    last_refugee = Column(JSON, nullable=True)
     # 地堡医疗危机 0-100：随在堡活跃病例累积，联盟援助成功缓解、失败激化；
     # 越过高压阈值后在堡全员士气持续受挫
     medical_crisis = Column(Integer, nullable=False, default=0)

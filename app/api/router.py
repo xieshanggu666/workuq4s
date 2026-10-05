@@ -31,6 +31,7 @@ from ..schemas import (
     AidPropose,
     AidIncidentChoice,
     AidCancel,
+    RefugeeReview,
     JobAssign,
     MedicalRegister,
     MedicalAdmit,
@@ -103,7 +104,8 @@ def get_session(sid: int, db: Session = Depends(get_db)):
     return get_session_detail(gs, db)
 
 
-def _serialize_resident(r, away_ids=None, trade_status=None, case_map=None, aid_status=None):
+def _serialize_resident(r, away_ids=None, trade_status=None, case_map=None,
+                        aid_status=None, refugee_status=None):
     active_case = (case_map or {}).get(r.id)
     return {
         "id": r.id,
@@ -121,6 +123,8 @@ def _serialize_resident(r, away_ids=None, trade_status=None, case_map=None, aid_
         "trade_status": trade_status,
         # 联盟援助协议角色：escorting=在途援助押运（按离堡结算）；proposed=待出发
         "aid_status": aid_status,
+        # 难民安置：quarantining=入境检疫区观察中（已建档但尚未接纳，不参与地堡生活）
+        "refugee_status": refugee_status,
         "joined_day": r.joined_day,
     }
 
@@ -150,6 +154,13 @@ def get_session_detail(gs, db):
         elif pact.get("status") == "proposed":
             for mid in pact.get("escorts", []):
                 aid_tag[mid] = "proposed"
+    # 检疫区难民（已建档居民，尚未接纳）：标注"检疫中"，不参与地堡生产/口粮
+    refugee_tag = {}
+    if gs.refugee_petition and gs.refugee_petition.get("status") == "quarantining":
+        for p in gs.refugee_petition.get("people", []):
+            mid = p.get("resident_id")
+            if mid is not None and p.get("alive", 1):
+                refugee_tag[mid] = "quarantining"
     # 活跃病例（登记/治疗/隔离）按居民编号映射，终态履历只保留在 medical_cases 中
     med_cases = gs.medical_cases or []
     case_map = {
@@ -157,7 +168,10 @@ def get_session_detail(gs, db):
         if c.get("status") in ("registered", "treating", "isolated")
     }
     residents = [
-        _serialize_resident(r, away_ids, trade_tag.get(r.id), case_map, aid_tag.get(r.id))
+        _serialize_resident(
+            r, away_ids, trade_tag.get(r.id), case_map,
+            aid_tag.get(r.id), refugee_tag.get(r.id),
+        )
         for r in gs.residents
     ]
     facilities = [
@@ -196,9 +210,11 @@ def get_session_detail(gs, db):
         expedition=gs.expedition,
         trade_order=gs.trade_order,
         aid_pact=gs.aid_pact,
+        refugee_petition=gs.refugee_petition,
         medical_cases=med_cases,
         # 床位/医护/病例计数概览（纯派生，由引擎计算保证与口径一致）
         medical_summary=BunkerEngine(db, gs).med_summary(),
+        refugee_summary=BunkerEngine(db, gs).refugee_summary(),
         medical_crisis=gs.medical_crisis or 0,
         reputation=gs.reputation if gs.reputation is not None else 50,
         residents=residents,
@@ -429,6 +445,40 @@ def aid_cancel(sid: int, body: AidCancel, db: Session = Depends(get_db)):
         db, gs,
         lambda eng: eng.cancel_aid(token=body.token),
         lambda eng: eng.reconcile_stale_aid("cancel", token=body.token),
+    )
+    return get_session_detail(gs, db)
+
+
+# ---- 跨聚落难民安置 ----
+@router.get("/sessions/{sid}/refugee/board")
+def refugee_board(sid: int, db: Session = Depends(get_db)):
+    """当日外部聚落提交的难民安置申请（按天确定性轮换，只读）。
+
+    下发的公告视图剥离潜藏感染标记：地堡只能看到人数、来源与健康概况，
+    真实感染情况须在入境检疫区观察中由医护筛查。
+    """
+    gs = _get_session_or_404(db, sid)
+    eng = BunkerEngine(db, gs)
+    return {
+        "day": gs.day,
+        "reputation": gs.reputation if gs.reputation is not None else 50,
+        "has_petition": gs.refugee_petition is not None,
+        "petitions": eng.refugee_board_public(),
+    }
+
+
+@router.post("/sessions/{sid}/refugee/review", response_model=SessionDetail)
+def refugee_review(sid: int, body: RefugeeReview, db: Session = Depends(get_db)):
+    """地堡审核难民安置申请：批准（逐人分配岗位、进入检疫区）或回绝。"""
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.review_refugee_petition(
+            body.petition_id, body.approve, jobs=body.jobs, token=body.token,
+        ),
+        lambda eng: eng.reconcile_stale_refugee(
+            body.petition_id, body.approve, token=body.token, jobs=body.jobs,
+        ),
     )
     return get_session_detail(gs, db)
 

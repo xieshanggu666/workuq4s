@@ -735,3 +735,101 @@ def test_aid_cancel_http_refund(client):
     r2 = client.post(f"/api/sessions/{sid}/aid/cancel", json={"token": token})
     assert r2.status_code == 200
     assert r2.json()["aid_pact"] is None
+
+
+# ---- 跨聚落难民安置 ----
+def test_refugee_board_endpoint_hides_infection(client):
+    """公告板接口下发申请列表，但绝不暴露潜藏感染标记。"""
+    r = client.post("/api/sessions", json={"name": "rf0"})
+    sid = r.json()["id"]
+    board = client.get(f"/api/sessions/{sid}/refugee/board").json()
+    assert board["day"] == 1
+    assert len(board["petitions"]) == 2
+    for p in board["petitions"]:
+        assert "infected" not in p and "health" not in p
+        assert all(set(x.keys()) == {"name", "age"} for x in p["people"])
+
+
+def test_refugee_reject_http(client):
+    """回绝申请：信誉下降，不建档，连点安全回放。"""
+    r = client.post("/api/sessions", json={"name": "rf1"})
+    sid = r.json()["id"]
+    pid = client.get(f"/api/sessions/{sid}/refugee/board").json()["petitions"][0]["id"]
+    rep_before = client.get(f"/api/sessions/{sid}").json()["reputation"]
+    r = client.post(f"/api/sessions/{sid}/refugee/review", json={
+        "petition_id": pid, "approve": False,
+    })
+    assert r.status_code == 200
+    assert r.json()["refugee_petition"] is None
+    assert r.json()["reputation"] == rep_before - 5
+    # 连点回绝：幂等回放，不重复扣信誉
+    r2 = client.post(f"/api/sessions/{sid}/refugee/review", json={
+        "petition_id": pid, "approve": False,
+    })
+    assert r2.status_code == 200
+    assert r2.json()["reputation"] == rep_before - 5
+
+
+def test_refugee_approve_quarantine_full_flow(client, monkeypatch):
+    """HTTP 全链路：批准入境（逐人岗位）→ 3 天检疫推进 → 接纳后无在检疫申请。"""
+    from app.services import engine as engine_mod
+
+    class Scripted:
+        def random(self):
+            return 0.9  # 不触发危机；检疫筛查不命中（测试公告本就可能带疫，期满终检兜底）
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    monkeypatch.setattr(engine_mod, "_rng", lambda: Scripted())
+
+    r = client.post("/api/sessions", json={"name": "rf2"})
+    sid = r.json()["id"]
+    petition = client.get(f"/api/sessions/{sid}/refugee/board").json()["petitions"][0]
+    jobs = ["general"] * petition["head"]
+    r = client.post(f"/api/sessions/{sid}/refugee/review", json={
+        "petition_id": petition["id"], "approve": True, "jobs": jobs,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["refugee_petition"]["status"] == "quarantining"
+    assert body["refugee_summary"]["head"] == petition["head"]
+    # 新居民已建档并标注"入境检疫中"
+    qres = [x for x in body["residents"] if x["refugee_status"] == "quarantining"]
+    assert len(qres) == petition["head"]
+
+    for d in range(3):
+        r = client.post(f"/api/sessions/{sid}/advance")
+        assert r.status_code == 200
+    final = client.get(f"/api/sessions/{sid}").json()
+    assert final["refugee_petition"] is None
+    assert final["refugee_summary"] is None
+    assert all(x["refugee_status"] is None for x in final["residents"])
+
+
+def test_refugee_approve_validates_jobs_http(client):
+    """岗位人数与难民不符：400，且不建档。"""
+    r = client.post("/api/sessions", json={"name": "rf3"})
+    sid = r.json()["id"]
+    petition = client.get(f"/api/sessions/{sid}/refugee/board").json()["petitions"][0]
+    r = client.post(f"/api/sessions/{sid}/refugee/review", json={
+        "petition_id": petition["id"], "approve": True,
+        "jobs": ["general"] * (petition["head"] + 1),
+    })
+    assert r.status_code == 400
+    assert client.get(f"/api/sessions/{sid}").json()["refugee_petition"] is None
+
+
+def test_refugee_mutual_exclusion_with_expedition_http(client):
+    """探索队在外期间审核难民申请：400。"""
+    r = client.post("/api/sessions", json={"name": "rf4"})
+    sid = r.json()["id"]
+    mid = r.json()["residents"][0]["id"]
+    client.post(f"/api/sessions/{sid}/expedition/send", json={
+        "member_ids": [mid], "supplies": {"food": 10, "water": 10},
+    })
+    pid = client.get(f"/api/sessions/{sid}/refugee/board").json()["petitions"][0]["id"]
+    r = client.post(f"/api/sessions/{sid}/refugee/review", json={
+        "petition_id": pid, "approve": False,
+    })
+    assert r.status_code == 400

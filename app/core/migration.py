@@ -5,6 +5,7 @@
 - pending_crisis / last_resolution / last_expedition / expedition：状态机快照列，旧行补 NULL
 - trade_order / last_trade：贸易救援订单与幂等凭据列，旧行补 NULL
 - aid_pact / last_aid：地堡联盟援助协议与幂等凭据列，旧行补 NULL
+- refugee_petition / last_refugee：跨聚落难民安置申请与幂等凭据列，旧行补 NULL
 - medical_cases：医疗救治中心病例簿列，旧行补 NULL
 - medical_crisis：地堡医疗危机表，旧行统一从 0 开始
 - reputation：对外信誉，旧行统一从初始值 50 开始
@@ -61,6 +62,11 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN aid_pact JSON"))
         if "last_aid" not in columns:
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_aid JSON"))
+        if "refugee_petition" not in columns:
+            # 跨聚落难民安置申请快照：旧档案无在检疫申请，补 NULL
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN refugee_petition JSON"))
+        if "last_refugee" not in columns:
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_refugee JSON"))
         if "reputation" not in columns:
             # NOT NULL + 常量默认值：旧档案从未开展贸易，信誉从初始值 50 开始
             conn.execute(
@@ -101,18 +107,19 @@ def reconcile_old_saves(engine):
         rows = conn.execute(
             text(
                 "SELECT id, status, pending_crisis, expedition, trade_order, "
-                "aid_pact, medical_cases, survivors "
+                "aid_pact, refugee_petition, medical_cases, survivors "
                 "FROM game_sessions"
             )
         ).all()
         updates = []
         for row in rows:
             (sid, status, crisis_raw, exp_raw, trade_raw,
-             aid_raw, med_raw, survivors) = row
+             aid_raw, refugee_raw, med_raw, survivors) = row
             old_crisis = _loads(crisis_raw)
             old_exp = _loads(exp_raw)
             old_trade = _loads(trade_raw)
             old_aid = _loads(aid_raw)
+            old_refugee = _loads(refugee_raw)
             old_med = _loads(med_raw)
             alive_count = None
             if {"id", "alive", "session_id"} <= resident_columns:
@@ -129,17 +136,20 @@ def reconcile_old_saves(engine):
                 new_exp, exp_changed = _clean_expedition(old_exp, conn, sid)
                 new_trade, trade_changed = _clean_trade_order(old_trade, conn, sid)
                 new_aid, aid_changed = _clean_aid_pact(old_aid, conn, sid)
+                new_refugee, refugee_changed = _clean_refugee_petition(old_refugee, conn, sid)
             else:
-                # 已结束：危机/探索队/贸易订单/援助协议快照一律清空，收敛到 ended
+                # 已结束：危机/探索队/贸易订单/援助协议/难民申请快照一律清空，收敛到 ended
                 new_crisis, crisis_changed = None, old_crisis is not None
                 new_exp, exp_changed = None, old_exp is not None
                 new_trade, trade_changed = None, old_trade is not None
                 new_aid, aid_changed = None, old_aid is not None
+                new_refugee, refugee_changed = None, old_refugee is not None
             # 病例簿归一化与档案阶段无关：活跃病例绑定的居民必须仍在档且状态一致
             new_med, med_changed = _clean_medical_cases(old_med, conn, sid)
 
             if (crisis_changed or exp_changed or trade_changed or aid_changed
-                    or med_changed or (alive_count is not None and alive_count != survivors)):
+                    or refugee_changed or med_changed
+                    or (alive_count is not None and alive_count != survivors)):
                 updates.append(
                     {
                         "sid": sid,
@@ -155,6 +165,9 @@ def reconcile_old_saves(engine):
                         "aid": json.dumps(new_aid, ensure_ascii=False)
                         if new_aid is not None
                         else None,
+                        "refugee": json.dumps(new_refugee, ensure_ascii=False)
+                        if new_refugee is not None
+                        else None,
                         "medical": json.dumps(new_med, ensure_ascii=False)
                         if new_med is not None
                         else None,
@@ -166,7 +179,8 @@ def reconcile_old_saves(engine):
                 text(
                     "UPDATE game_sessions SET pending_crisis = :crisis, "
                     "expedition = :expedition, trade_order = :trade, "
-                    "aid_pact = :aid, medical_cases = :medical, "
+                    "aid_pact = :aid, refugee_petition = :refugee, "
+                    "medical_cases = :medical, "
                     "survivors = :survivors WHERE id = :sid"
                 ),
                 u,
@@ -332,6 +346,50 @@ def _clean_aid_pact(pact, conn, sid):
     )
     cleaned["pending_incident"] = pending
     return cleaned, changed or pending_changed
+
+
+# 难民安置申请合法状态链（持久化快照只可能是检疫中；终态只写凭据/日志）
+_REFUGEE_STATUSES = {"quarantining", "admitted", "rejected"}
+
+
+def _clean_refugee_petition(petition, conn, sid):
+    """跨聚落难民安置申请快照归一化（口径同 _clean_aid_pact）。
+
+    - 结构残缺 / 非法状态：清空（无法恢复的申请）
+    - 已收敛终态（admitted/rejected）残留在列上：清空，统一以"无在检疫申请"开始
+    - 检疫难民夹杂悬空居民编号：剔除；剔除后无人则整份申请清除
+      （接纳结算时以存活名单为准，悬空编号不阻塞每日检疫推进）
+
+    返回 (归一化快照, 是否发生变化)。
+    """
+    if petition is None:
+        return None, False
+    if not isinstance(petition, dict):
+        return None, True
+    status = petition.get("status")
+    if status not in _REFUGEE_STATUSES:
+        return None, True
+    if status in ("admitted", "rejected"):
+        return None, True
+    raw_people = petition.get("people")
+    if not isinstance(raw_people, list) or not petition.get("token"):
+        return None, True
+    known = _resident_ids(conn, sid)
+    people, changed = [], False
+    for p in raw_people:
+        if not isinstance(p, dict):
+            changed = True
+            continue
+        rid = p.get("resident_id")
+        if rid is None or rid not in known:
+            changed = True
+            continue
+        people.append(p)
+    if not people:
+        return None, True
+    cleaned = dict(petition)
+    cleaned["people"] = people
+    return cleaned, changed
 
 
 # 病例合法状态：登记/治疗/隔离（活跃）与康复/病亡（终态）
